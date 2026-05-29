@@ -1,0 +1,317 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Compute script: builds the .npz cache for the HIM_B paper figure.
+  HIM definition: Pth < 0.5 * Pmin
+  Restricts to R <= 500 pc in the XY plane.
+"""
+
+import os
+import warnings
+import numpy as np
+import zarr
+import dask.array as da
+from scipy.io import loadmat
+from scipy.interpolate import interp1d
+
+# ════════════════════════════════════════════════════════════════════════════
+# ██  PATHS
+# ════════════════════════════════════════════════════════════════════════════
+ZARR_PATH  = r"C:\Users\matan\Desktop\research_10.0\datasets\f98_sm_opt2_edendist.zarr"
+MAT_PATH   = r"C:\Users\matan\Desktop\research_10.0\datasets\Temp_Bialy_interp.mat"
+CACHE_PATH = r"C:\Users\matan\Desktop\research_10.0\fig2_histograms\compute_data.npz"
+
+# ════════════════════════════════════════════════════════════════════════════
+# ██  SCIENCE SETTINGS
+# ════════════════════════════════════════════════════════════════════════════
+Z_LIST_PC  = [0, 150, 300]
+R_MAX_PC   = 500.0      # XY cylinder radius cut
+
+RHO_FIELD  = "density"
+IUV_FIELD  = "Iuv_final"
+T_FIELD    = "T"
+T_HIM      = 1.0e6      # K assigned to HIM cells in HIM_A / HIM_B
+
+N_FLOOR    = 1e-12
+IUV_FLOOR  = 1e-30
+P_FLOOR    = 1e-30
+
+# ════════════════════════════════════════════════════════════════════════════
+# ██  PHYSICAL CONSTANTS
+# ════════════════════════════════════════════════════════════════════════════
+K_B     = 1.380649e-16
+M_H     = 1.6735575e-24
+MU      = 1.4
+PC_CM   = 3.085677581491367e18
+
+SIGMA_STAR           = 38.4
+Z_H_PC               = 413.0
+RHO_DM               = 0.0133
+G_PC_MSUN_KMS        = 4.30091e-3
+KM2S2_PER_PC_TO_CGS  = 1.0e10 / PC_CM
+
+# ════════════════════════════════════════════════════════════════════════════
+# ██  HELPERS
+# ════════════════════════════════════════════════════════════════════════════
+def nearest_idx(arr, val):
+    return int(np.argmin(np.abs(arr - val)))
+
+def f2d(x):
+    return np.asarray(x, dtype=np.float64)
+
+# ════════════════════════════════════════════════════════════════════════════
+# ██  GRAVITY
+# ════════════════════════════════════════════════════════════════════════════
+def g_ext_cgs(z_pc):
+    z_abs = np.abs(z_pc)
+    s = SIGMA_STAR * (1.0 - np.exp(-z_abs / Z_H_PC)) + 2.0 * RHO_DM * z_abs
+    return 2.0 * np.pi * G_PC_MSUN_KMS * s * KM2S2_PER_PC_TO_CGS
+
+# ════════════════════════════════════════════════════════════════════════════
+# ██  Pmin / Pmax
+# ════════════════════════════════════════════════════════════════════════════
+def build_pmin_pmax_functions(mat_path):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        d = loadmat(mat_path)
+
+    IUV_grid = np.array(d["IUV_"]).squeeze().astype(float).ravel()
+    P_grid   = np.array(d["P_"]).squeeze().astype(float).ravel()
+    T_2d_P   = np.array(d["T_2d_P"]).astype(float)
+
+    if np.any(np.diff(P_grid) <= 0):
+        order  = np.argsort(P_grid)
+        P_grid = P_grid[order]
+        T_2d_P = T_2d_P[:, order]
+
+    Pmin_list, Pmax_list = [], []
+    for i in range(len(IUV_grid)):
+        T_row = np.clip(T_2d_P[i, :], 1e-30, None)
+        n_row = np.clip(P_grid / T_row, 1e-30, None)
+        dn    = np.gradient(n_row, P_grid)
+        s     = np.sign(dn);  s[s == 0] = 1
+        ch    = np.where(s[:-1] * s[1:] < 0)[0]
+
+        if ch.size == 0:
+            Pmin_list.append(np.nan);  Pmax_list.append(np.nan);  continue
+
+        def lin_root(j):
+            x0, x1 = P_grid[j], P_grid[j + 1]
+            y0, y1 = dn[j], dn[j + 1]
+            return x0 - y0 * (x1 - x0) / (y1 - y0) if (y1 - y0) != 0 else x0
+
+        Pmin_list.append(float(lin_root(int(ch[0]))))
+        Pmax_list.append(float(lin_root(int(ch[-1]))))
+
+    Pmin_arr = np.array(Pmin_list, dtype=float)
+    Pmax_arr = np.array(Pmax_list, dtype=float)
+
+    def make_interp(P_arr):
+        good = np.isfinite(P_arr) & (P_arr > 0) & (IUV_grid > 0)
+        logI = np.log10(IUV_grid[good]);  logP = np.log10(P_arr[good])
+        idx  = np.argsort(logI)
+        f    = interp1d(logI[idx], logP[idx], kind="linear",
+                        bounds_error=False,
+                        fill_value=(logP[idx][0], logP[idx][-1]))
+        return lambda Iuv2d: 10.0 ** f(
+            np.log10(np.clip(np.asarray(Iuv2d, float), IUV_FLOOR, None)))
+
+    return make_interp(Pmin_arr), make_interp(Pmax_arr)
+
+# ════════════════════════════════════════════════════════════════════════════
+# ██  PTOT INTEGRATION
+# ════════════════════════════════════════════════════════════════════════════
+def compute_Ptot_slices(n_all_by_model, z_pc, z_req):
+    pos   = np.where(z_pc >= 0)[0]
+    zpos  = z_pc[pos]
+    order = np.argsort(zpos)
+    pos   = pos[order];  zpos = zpos[order]
+
+    g    = g_ext_cgs(zpos)
+    z_cm = zpos * PC_CM
+    dz   = np.diff(z_cm)
+    j_top = len(zpos) - 1
+
+    req_j = {float(zv): nearest_idx(zpos, float(zv)) for zv in z_req}
+    out   = {m: {} for m in n_all_by_model}
+
+    for model, n_all in n_all_by_model.items():
+        P_above     = np.zeros_like(f2d(n_all[pos[j_top]]))
+        rho_above   = MU * M_H * f2d(n_all[pos[j_top]])
+        integ_above = rho_above * g[j_top]
+
+        for zv, j in req_j.items():
+            if j == j_top:
+                out[model][zv] = (P_above / K_B).copy()
+
+        for j in range(j_top - 1, -1, -1):
+            iz      = pos[j]
+            rho_j   = MU * M_H * f2d(n_all[iz])
+            integ_j = rho_j * g[j]
+            P_j     = P_above + 0.5 * (integ_j + integ_above) * dz[j]
+
+            for zv, jj in req_j.items():
+                if jj == j and zv not in out[model]:
+                    out[model][zv] = (P_j / K_B).copy()
+
+            P_above     = P_j
+            integ_above = integ_j
+
+    return out
+
+# ════════════════════════════════════════════════════════════════════════════
+# ██  CORE PIPELINE
+# ════════════════════════════════════════════════════════════════════════════
+def run_pipeline(n_raw, T_raw, Iuv_raw,
+                 Pth_raw, Pmin_slc, Pmax_slc,
+                 him_mask,
+                 n_zarr, Iuv_zarr, T_full,
+                 z_pc_full, Pmin_func, Pmax_func):
+    """
+    Build RAW / HIM_A / HIM_B model variants using HIM definition: Pth < 0.5*Pmin.
+    Compute Ptot via hydrostatic integration, pack neutral + R<=500pc cells, save cache.
+    """
+
+    # ── model variants at the requested z-slices ──────────────────────────
+    n_RAW, Pth_RAW = n_raw, Pth_raw
+
+    n_HIMA, Pth_HIMA = [], []
+    for n2d, Pth, him, Pmin in zip(n_raw, Pth_raw, him_mask, Pmin_slc):
+        nA = n2d.copy();  nA[him] = Pmin[him] / T_HIM
+        PA = Pth.copy();  PA[him] = Pmin[him]
+        n_HIMA.append(nA);  Pth_HIMA.append(PA)
+
+    n_HIMB, Pth_HIMB = [], []
+    for n2d, Pth, him, Pmax in zip(n_raw, Pth_raw, him_mask, Pmax_slc):
+        nB = n2d.copy();  nB[him] = Pmax[him] / T_HIM
+        PB = Pth.copy();  PB[him] = Pmax[him]
+        n_HIMB.append(nB);  Pth_HIMB.append(PB)
+
+    # ── full-z n for Ptot integration (HIM: Pth < 0.5*Pmin) ──────────────
+    def full_z_n(model_name):
+        n_all = []
+        for iz in range(len(z_pc_full)):
+            nz  = f2d(n_zarr[iz, :, :])
+            I2d = f2d(Iuv_zarr[iz, :, :])
+            T2d = f2d(T_full[iz, :, :])
+            Pth = nz * T2d
+            Pm  = Pmin_func(I2d)
+            PM  = Pmax_func(I2d)
+            him = (Pth < 0.5 * Pm) & np.isfinite(Pm)
+            if model_name == "RAW":
+                n_all.append(nz)
+            elif model_name == "HIM_A":
+                nA = nz.copy();  nA[him] = Pm[him] / T_HIM;  n_all.append(nA)
+            elif model_name == "HIM_B":
+                nB = nz.copy();  nB[him] = PM[him] / T_HIM;  n_all.append(nB)
+            if iz % 50 == 0:
+                print(f"  {model_name}: plane {iz}/{len(z_pc_full)-1}")
+        return n_all
+
+    n_all_models = {}
+    for model in ["RAW", "HIM_A", "HIM_B"]:
+        print(f"  Building full-z density for {model}...")
+        n_all_models[model] = full_z_n(model)
+
+    print("  Computing Ptot via hydrostatic integration...")
+    Ptot_maps = compute_Ptot_slices(n_all_models, z_pc_full, Z_LIST_PC)
+
+    def get_alpha(Ptot_slcs, Pth_slcs):
+        return [f2d(Pt) / np.clip(f2d(Ph), P_FLOOR, None)
+                for Pt, Ph in zip(Ptot_slcs, Pth_slcs)]
+
+    models_data = {
+        "RAW"  : {"n": n_RAW,  "T": T_raw, "Iuv": Iuv_raw,
+                  "Pth": Pth_RAW,
+                  "Ptot": [f2d(Ptot_maps["RAW"][float(z)])   for z in Z_LIST_PC]},
+        "HIM_A": {"n": n_HIMA, "T": T_raw, "Iuv": Iuv_raw,
+                  "Pth": Pth_HIMA,
+                  "Ptot": [f2d(Ptot_maps["HIM_A"][float(z)]) for z in Z_LIST_PC]},
+        "HIM_B": {"n": n_HIMB, "T": T_raw, "Iuv": Iuv_raw,
+                  "Pth": Pth_HIMB,
+                  "Ptot": [f2d(Ptot_maps["HIM_B"][float(z)]) for z in Z_LIST_PC]},
+    }
+    for m in models_data:
+        models_data[m]["alpha"] = get_alpha(
+            models_data[m]["Ptot"], models_data[m]["Pth"])
+
+    # ── pack: neutral cells (not HIM) + R<=500 pc, then save ─────────────
+    print("  Packing and saving...")
+    save_dict = {}
+    qtys = ["n", "T", "Iuv", "Pth", "Ptot", "alpha"]
+
+    for model, mdat in models_data.items():
+        for zi, zv in enumerate(Z_LIST_PC):
+            neutral = (~him_mask[zi].ravel()) & r_mask_flat
+
+            save_dict[f"{model}__n_weight__z{int(zv)}"] = \
+                mdat["n"][zi].ravel()[neutral].astype(np.float32)
+
+            for qty in qtys:
+                save_dict[f"{model}__{qty}__z{int(zv)}"] = \
+                    mdat[qty][zi].ravel()[neutral].astype(np.float32)
+
+    save_dict["z_list_pc"] = np.array(Z_LIST_PC, dtype=float)
+
+    os.makedirs(os.path.dirname(CACHE_PATH), exist_ok=True)
+    np.savez_compressed(CACHE_PATH, **save_dict)
+    print(f"  Saved → {CACHE_PATH}")
+
+# ════════════════════════════════════════════════════════════════════════════
+# ██  MAIN
+# ════════════════════════════════════════════════════════════════════════════
+def compute_and_cache():
+    print("=== Computing and caching (HIM: Pth < 0.5·Pmin) ===")
+
+    root      = zarr.open(ZARR_PATH, mode="r")
+    z_pc_full = f2d(root["z_pc"][:]).ravel()
+    n_zarr    = root[RHO_FIELD]
+    Iuv_zarr  = root[IUV_FIELD]
+
+    print("Loading full T array...")
+    T_full = da.from_zarr(os.path.join(ZARR_PATH, T_FIELD)).compute().astype(np.float64)
+    print(f"  T shape: {T_full.shape}")
+
+    Pmin_func, Pmax_func = build_pmin_pmax_functions(MAT_PATH)
+    z_idx = [nearest_idx(z_pc_full, z) for z in Z_LIST_PC]
+    print(f"z = {Z_LIST_PC} pc → indices {z_idx}")
+
+    # ── XY radius mask ────────────────────────────────────────────────────
+    x_pc = f2d(root["x_pc"][:]).ravel()
+    y_pc = f2d(root["y_pc"][:]).ravel()
+    XX, YY = np.meshgrid(x_pc, y_pc, indexing="ij")
+    R2D = np.sqrt(XX**2 + YY**2)
+    global r_mask_flat
+    r_mask_flat = (R2D.ravel() <= R_MAX_PC)
+    print(f"  R<=500 pc: {r_mask_flat.sum()} / {r_mask_flat.size} cells "
+          f"({100*r_mask_flat.mean():.1f}%)")
+
+    # ── load z-slices ─────────────────────────────────────────────────────
+    print("Loading slices...")
+    n_raw   = [f2d(n_zarr[k, :, :])   for k in z_idx]
+    T_raw   = [f2d(T_full[k, :, :])   for k in z_idx]
+    Iuv_raw = [f2d(Iuv_zarr[k, :, :]) for k in z_idx]
+
+    Pth_raw  = [n2d * T2d for n2d, T2d in zip(n_raw, T_raw)]
+    Pmin_slc = [Pmin_func(I2d) for I2d in Iuv_raw]
+    Pmax_slc = [Pmax_func(I2d) for I2d in Iuv_raw]
+
+    # ── HIM mask: Pth < 0.5 * Pmin ────────────────────────────────────────
+    him_mask = [
+        (Pth < 0.5 * Pmin) & np.isfinite(Pmin)
+        for Pth, Pmin in zip(Pth_raw, Pmin_slc)
+    ]
+
+    run_pipeline(
+        n_raw, T_raw, Iuv_raw,
+        Pth_raw, Pmin_slc, Pmax_slc,
+        him_mask,
+        n_zarr, Iuv_zarr, T_full,
+        z_pc_full, Pmin_func, Pmax_func,
+    )
+
+    print("\n=== Done ===")
+
+
+if __name__ == "__main__":
+    compute_and_cache()
