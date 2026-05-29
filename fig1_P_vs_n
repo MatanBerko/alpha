@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Thermal equilibrium curves: P/kB vs n for selected Iuv values.
+Source: Bialy/Wolfire T(n, Iuv) matrix — Temp_Bialy_interp.mat
+"""
+
+import os
+import warnings
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.ticker import LogLocator
+from scipy.io import loadmat
+from scipy.interpolate import RectBivariateSpline
+from scipy.signal import savgol_filter
+
+# ═══════════════════════════════════════════════════════════════════════
+# ██  PATHS
+# ═══════════════════════════════════════════════════════════════════════
+MAT_PATH = r"C:\Users\matan\Desktop\research_10.0\datasets\Temp_Bialy_interp.mat"
+OUT_DIR  = r"C:\Users\matan\Desktop\research_10.0\fig1_P_vs_n"
+OUT_NAME = "fig1_bialy_P_vs_n.png"
+
+# ═══════════════════════════════════════════════════════════════════════
+# ██  DESIGN
+# ═══════════════════════════════════════════════════════════════════════
+FIG_W = 5.0
+FIG_H = 4.2
+DPI   = 600
+
+# (Iuv value, color, linewidth, zorder, legend label)
+IUV_CURVES = [
+    (0.1,  "#4575b4", 1.5, 2, r"$I_{\rm uv} = 0.1$"),
+    (0.3,  "#74add1", 1.5, 2, r"$I_{\rm uv} = 0.3$"),
+    (1.0,  "black",   2.5, 5, r"$I_{\rm uv} = 1$"),
+    (3.0,  "#f46d43", 1.5, 2, r"$I_{\rm uv} = 3$"),
+    (10.0, "#d73027", 1.5, 2, r"$I_{\rm uv} = 10$"),
+]
+
+# ── Unstable branch ────────────────────────────────────────────────────
+UNSTABLE_LS       = "dashed"
+UNSTABLE_LW_SCALE = 0.85
+
+# ── Turning point markers ──────────────────────────────────────────────
+SHOW_MARKERS  = True
+MARKER        = "o"
+MARKER_SIZE   = 4.5
+MARKER_LW     = 0.9
+
+# ── Annotations on Iuv=1 only ─────────────────────────────────────────
+ANNOTATE_PMINMAX    = True
+ANNOTATE_UNSTABLE   = True
+PMINMAX_FS          = 8.5
+UNSTABLE_FS         = 7.5
+
+# ── Smoothing for turning point detection only (not for plotting) ──────
+SAVGOL_WIN  = 41    # must be odd
+SAVGOL_POLY = 3
+
+# ── Turning point detection thresholds ────────────────────────────────
+EDGE_FRAC      = 0.02   # FIX: was 0.05 — tighter edge exclusion so Iuv=10 Pmax is not clipped
+AMP_THRESHOLD  = 0.15   # FIX: was 0.30 — lower dex threshold so shallow S-curves are accepted
+
+# ── Axis limits ────────────────────────────────────────────────────────
+N_LIM = (5e-2, 2e2)
+P_LIM = (3e2, 1e5)
+
+# ── Labels ─────────────────────────────────────────────────────────────
+XLABEL   = r"$n\;[\mathrm{cm}^{-3}]$"
+YLABEL   = r"$P/k_B\;[\mathrm{K\,cm}^{-3}]$"
+LABEL_FS = 11
+TICK_FS  = 9
+TICK_DIR = "in"
+
+# ── Legend ─────────────────────────────────────────────────────────────
+LEGEND_LOC   = "upper left"
+LEGEND_FS    = 8.5
+LEGEND_ALPHA = 0.0
+
+# ── Annotation offsets for Pmin/Pmax labels (Iuv=1 only) ──────────────
+PMAX_TEXT_OFFSET = (0.15, 1.6)
+PMIN_TEXT_OFFSET = (6.0,  0.3)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ██  LOAD
+# ═══════════════════════════════════════════════════════════════════════
+def load_bialy(mat_path):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        d = loadmat(mat_path, squeeze_me=True, struct_as_record=False)
+
+    IUV_grid = np.array(d["IUV_"], dtype=float).ravel()
+    n_grid   = np.array(d["n_"],   dtype=float).ravel()
+    T_2d_n   = np.array(d["T_2d_n"], dtype=float)   # (n_IUV, n_n)
+
+    iu = np.argsort(IUV_grid);  IUV_grid = IUV_grid[iu]
+    in_ = np.argsort(n_grid);   n_grid   = n_grid[in_]
+
+    if T_2d_n.shape == (len(IUV_grid), len(n_grid)):
+        T_2d_n = T_2d_n[iu, :][:, in_]
+    elif T_2d_n.shape == (len(n_grid), len(IUV_grid)):
+        T_2d_n = T_2d_n.T[iu, :][:, in_]
+    else:
+        raise ValueError(f"Unexpected T_2d_n shape: {T_2d_n.shape}")
+
+    print(f"n_grid  : {len(n_grid)} pts, {n_grid.min():.3g} – {n_grid.max():.3g} cm-3")
+    print(f"IUV_grid: {len(IUV_grid)} pts, {IUV_grid.min():.3g} – {IUV_grid.max():.3g}")
+    print(f"T_2d_n  : {T_2d_n.shape}")
+
+    logI = np.log10(np.clip(IUV_grid, 1e-30, None))
+    logn = np.log10(np.clip(n_grid,   1e-30, None))
+    logT = np.log10(np.clip(T_2d_n,   1.0,   None))
+    spline = RectBivariateSpline(logI, logn, logT, kx=3, ky=3)
+
+    return spline, n_grid, IUV_grid
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ██  CURVE
+# ═══════════════════════════════════════════════════════════════════════
+def get_curve(spline, n_grid, iuv_val):
+    """
+    Returns (n, P, i_pmax, i_pmin).
+    Turning point detection uses smoothed log P; plotting uses raw P.
+    """
+    logI = np.log10(iuv_val)
+    logn = np.log10(np.clip(n_grid, 1e-30, None))
+    logT = spline(logI, logn, grid=False)
+    T    = np.clip(10.0 ** logT, 1.0, None)
+    P    = n_grid * T
+
+    # smooth in log space for robust turning-point detection
+    logP = np.log10(np.clip(P, 1e-30, None))
+    win  = SAVGOL_WIN if SAVGOL_WIN % 2 == 1 else SAVGOL_WIN + 1
+    win  = min(win, len(logP) - 2)
+    if win % 2 == 0:
+        win -= 1
+    logP_s = savgol_filter(logP, window_length=win,
+                           polyorder=SAVGOL_POLY, mode="interp")
+
+    dP = np.gradient(logP_s, logn)
+    s  = np.sign(dP); s[s == 0] = 1
+    ch = np.where(s[:-1] * s[1:] < 0)[0]
+
+    maxima = [c for c in ch if s[c] > 0]
+    minima = [c for c in ch if s[c] < 0]
+
+    # FIX: tighter edge exclusion (2% instead of 5%)
+    edge   = int(EDGE_FRAC * len(n_grid))
+    maxima = [c for c in maxima if edge < c < len(n_grid) - edge]
+    minima = [c for c in minima if edge < c < len(n_grid) - edge]
+
+    i_pmax = i_pmin = None
+    if maxima and minima:
+        i_pmax = maxima[0]
+        after  = [m for m in minima if m > i_pmax]
+        if after:
+            i_pmin = after[0]
+            amp = logP_s[i_pmax] - logP_s[i_pmin]
+            # FIX: lower amplitude threshold (0.15 dex instead of 0.30)
+            if amp < AMP_THRESHOLD:
+                i_pmax = i_pmin = None
+
+    # debug output — remove once verified
+    status = f"Pmax@n={n_grid[i_pmax]:.2f}, Pmin@n={n_grid[i_pmin]:.2f}" \
+             if i_pmax is not None else "no S-curve detected"
+    print(f"  Iuv={iuv_val:5.1f}  →  {status}")
+
+    return n_grid, P, i_pmax, i_pmin
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ██  PLOT
+# ═══════════════════════════════════════════════════════════════════════
+def main():
+    spline, n_grid, IUV_grid = load_bialy(MAT_PATH)
+
+    fig, ax = plt.subplots(figsize=(FIG_W, FIG_H))
+    unstable_labeled = False
+
+    for (iuv_val, color, lw, zo, label) in IUV_CURVES:
+        n, P, i_pmax, i_pmin = get_curve(spline, n_grid, iuv_val)
+        is_ref = abs(iuv_val - 1.0) < 0.01
+
+        # ── split into stable / unstable / stable segments ─────────────
+        if i_pmax is not None and i_pmin is not None:
+            lo, hi = min(i_pmax, i_pmin), max(i_pmax, i_pmin)
+            segs = [
+                (n[:lo+1],   P[:lo+1],   False),
+                (n[lo:hi+1], P[lo:hi+1], True),
+                (n[hi:],     P[hi:],     False),
+            ]
+        else:
+            segs = [(n, P, False)]
+
+        first = True
+        for ns, Ps, unstable in segs:
+            ls  = UNSTABLE_LS if unstable else "solid"
+            slw = lw * UNSTABLE_LW_SCALE if unstable else lw
+            ax.plot(ns, Ps, color=color, lw=slw, ls=ls, zorder=zo,
+                    label=label if first else None)
+            first = False
+
+            # "unstable" label — Iuv=1 only, once
+            if unstable and ANNOTATE_UNSTABLE and is_ref and not unstable_labeled:
+                mid = len(ns) // 2
+                ax.text(ns[mid] * 1.4, Ps[mid], "unstable",
+                        fontsize=UNSTABLE_FS, color="gray",
+                        va="center", fontstyle="italic", zorder=10)
+                unstable_labeled = True
+
+        # ── markers and Pmin/Pmax annotations ─────────────────────────
+        if SHOW_MARKERS and i_pmax is not None:
+            ax.plot(n[i_pmax], P[i_pmax], marker=MARKER, ms=MARKER_SIZE,
+                    color=color, mfc=color, mew=MARKER_LW, ls="none", zorder=zo+1)
+            ax.plot(n[i_pmin], P[i_pmin], marker=MARKER, ms=MARKER_SIZE,
+                    color=color, mfc="white", mew=MARKER_LW, ls="none", zorder=zo+1)
+
+            if ANNOTATE_PMINMAX and is_ref:
+                ax.annotate(r"$P_{\rm max}$",
+                            xy=(n[i_pmax], P[i_pmax]),
+                            xytext=(n[i_pmax] * PMAX_TEXT_OFFSET[0],
+                                    P[i_pmax] * PMAX_TEXT_OFFSET[1]),
+                            fontsize=PMINMAX_FS, color="black", ha="center",
+                            arrowprops=dict(arrowstyle="-", color="gray",
+                                            lw=0.8, shrinkA=2, shrinkB=2))
+                ax.annotate(r"$P_{\rm min}$",
+                            xy=(n[i_pmin], P[i_pmin]),
+                            xytext=(n[i_pmin] * PMIN_TEXT_OFFSET[0],
+                                    P[i_pmin] * PMIN_TEXT_OFFSET[1]),
+                            fontsize=PMINMAX_FS, color="black", ha="center",
+                            arrowprops=dict(arrowstyle="-", color="gray",
+                                            lw=0.8, shrinkA=2, shrinkB=2))
+
+    # ── axes ───────────────────────────────────────────────────────────
+    ax.set_xscale("log"); ax.set_yscale("log")
+    ax.set_xlim(N_LIM);   ax.set_ylim(P_LIM)
+    ax.set_xlabel(XLABEL, fontsize=LABEL_FS)
+    ax.set_ylabel(YLABEL, fontsize=LABEL_FS)
+    ax.tick_params(axis="both", which="both", direction=TICK_DIR, labelsize=TICK_FS)
+    ax.tick_params(right=True, top=True, which="both", direction="in")
+    subs = np.arange(2, 10) * 0.1
+    ax.xaxis.set_minor_locator(LogLocator(base=10, subs=subs, numticks=20))
+    ax.yaxis.set_minor_locator(LogLocator(base=10, subs=subs, numticks=20))
+    ax.legend(loc=LEGEND_LOC, fontsize=LEGEND_FS,
+              framealpha=LEGEND_ALPHA, handlelength=2.2, borderpad=0.6)
+
+    fig.tight_layout()
+    os.makedirs(OUT_DIR, exist_ok=True)
+    outpath = os.path.join(OUT_DIR, OUT_NAME)
+    plt.savefig(outpath, dpi=DPI, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {outpath}")
+
+if __name__ == "__main__":
+    main()
