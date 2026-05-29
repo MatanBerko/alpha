@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Paper figure: HIM_B model, z=0 — all quantities, both weightings.
+HIM definition: Pth < 0.5 * Pmin. Smooth PDFs via Gaussian KDE.
+"""
+
+import os
+import numpy as np
+from scipy.stats import gaussian_kde
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+
+# ════════════════════════════════════════════════════════════════════════════
+# ██  USER SETTINGS
+# ════════════════════════════════════════════════════════════════════════════
+OUT_DIR    = r"C:\Users\matan\Desktop\research_10.0\fig2_histograms"
+CACHE_PATH = r"C:\Users\matan\Desktop\research_10.0\fig2_histograms\compute_data.npz"
+OUT_FILE   = "fig2_histograms.png"
+RUN_LABEL  = r"HIM: $P_\mathrm{th} < 0.5\,P_\mathrm{min}$"
+
+MODEL  = "HIM_B"
+Z_PLOT = 0
+
+QUANTITIES = ["n", "Iuv", "T", "Pth", "Ptot", "alpha"]
+XLABELS = {
+    "n"    : r"$\log_{10}\,n\ [\mathrm{cm}^{-3}]$",
+    "Iuv"  : r"$\log_{10}\,I_\mathrm{UV}$",
+    "T"    : r"$\log_{10}\,T\ [\mathrm{K}]$",
+    "Pth"  : r"$\log_{10}(P_\mathrm{th}/k_B)\ [\mathrm{K\,cm}^{-3}]$",
+    "Ptot" : r"$\log_{10}(P_\mathrm{tot}/k_B)\ [\mathrm{K\,cm}^{-3}]$",
+    "alpha": r"$\alpha$",
+}
+ROW_LABELS = {
+    "n"    : r"$n\ [\mathrm{cm}^{-3}]$",
+    "Iuv"  : r"$I_\mathrm{UV}$",
+    "T"    : r"$T\ [\mathrm{K}]$",
+    "Pth"  : r"$P_\mathrm{th}/k_B\ [\mathrm{K\,cm}^{-3}]$",
+    "Ptot" : r"$P_\mathrm{tot}/k_B\ [\mathrm{K\,cm}^{-3}]$",
+    "alpha": r"$\alpha = P_\mathrm{tot}/P_\mathrm{th}$",
+}
+
+ALPHA_LINEAR = True
+
+FLOORS = {
+    "n": 1e-12, "Iuv": 1e-30, "T": 1.0,
+    "Pth": 1e-30, "Ptot": 1e-30, "alpha": 1e-30,
+}
+
+KDE_NPTS       = 300
+KDE_BW = {
+    "n"    : 0.8,
+    "Iuv"  : 0.8,
+    "T"    : 1.2,
+    "Pth"  : 0.8,
+    "Ptot" : 0.8,
+    "alpha": 0.6,
+}
+KDE_BW_DEFAULT = 0.8
+KDE_MAX_PTS    = 500_000
+
+XPCT_LO  = 0.5
+XPCT_HI  = 99.9
+MIN_SPAN = 0.15
+XPCT_HI_OVERRIDE = {
+    "T"    : 99.9,
+    "alpha": 95.0,
+}
+XLIM_OVERRIDE = {
+    "T": (2.0, 4.2),
+}
+
+YMAX_FRACTION = {}   # per-quantity y-clip; empty = no clip
+
+LINE_COLOR      = "#1a1a2e"
+LINE_COLOR_MASS = "#c0392b"
+LW = 1.5
+
+FIG_W   = 6.5
+ROW_H   = 1.35
+COL_GAP = 0.08
+ROW_GAP = 0.18
+DPI     = 600
+
+FS_TICK   = 7
+FS_LABEL  = 8
+FS_COLHDR = 9
+FS_RUNLBL = 7.5
+
+# ════════════════════════════════════════════════════════════════════════════
+# ██  HELPERS
+# ════════════════════════════════════════════════════════════════════════════
+def to_plot_space(arr, qty):
+    if ALPHA_LINEAR and qty == "alpha":
+        return arr.astype(float)
+    return np.log10(np.clip(arr.astype(float), FLOORS[qty], None))
+
+
+def robust_xlim(x, qty):
+    if qty in XLIM_OVERRIDE:
+        return XLIM_OVERRIDE[qty]
+    x = x[np.isfinite(x)]
+    if x.size == 0:
+        return 0.0, 1.0
+    xhi_pct = XPCT_HI_OVERRIDE.get(qty, XPCT_HI)
+    xlo, xhi = np.percentile(x, [XPCT_LO, xhi_pct])
+    span = xhi - xlo
+    if span < MIN_SPAN:
+        xc = 0.5 * (xlo + xhi)
+        xlo, xhi = xc - 0.5 * MIN_SPAN, xc + 0.5 * MIN_SPAN
+        span = MIN_SPAN
+    pad = 0.03 * span
+    return xlo - pad, xhi + pad
+
+
+def make_kde_pdf(x, xgrid, weights=None, bw_factor=1.0):
+    x = x[np.isfinite(x)]
+    if weights is not None:
+        weights = np.asarray(weights, dtype=float)
+        weights = weights / weights.sum()
+
+    if x.size > KDE_MAX_PTS:
+        rng = np.random.default_rng(42)
+        idx = rng.choice(x.size, KDE_MAX_PTS, replace=False)
+        x = x[idx]
+        if weights is not None:
+            weights = weights[idx]
+            weights = weights / weights.sum()
+
+    if x.size < 2:
+        return np.zeros_like(xgrid, dtype=float)
+
+    kde = gaussian_kde(x, weights=weights)
+    kde.set_bandwidth(kde.factor * bw_factor)
+    return kde(xgrid)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# ██  FIGURE
+# ════════════════════════════════════════════════════════════════════════════
+def make_figure():
+    cache = dict(np.load(CACHE_PATH, allow_pickle=False))
+    zvk   = int(Z_PLOT)
+
+    nrows = len(QUANTITIES)
+    fig, axes = plt.subplots(
+        nrows=nrows, ncols=2,
+        figsize=(FIG_W, ROW_H * nrows),
+        dpi=DPI,
+        gridspec_kw={"hspace": ROW_GAP, "wspace": COL_GAP},
+    )
+
+    col_titles  = ["Volume-weighted PDF", "Mass-weighted PDF"]
+    col_colors  = [LINE_COLOR, LINE_COLOR_MASS]
+
+    for col, title in enumerate(col_titles):
+        axes[0, col].set_title(title, fontsize=FS_COLHDR, fontweight="bold", pad=4)
+
+    for row, qty in enumerate(QUANTITIES):
+        bw = KDE_BW.get(qty, KDE_BW_DEFAULT)
+
+        arr_raw = cache[f"{MODEL}__{qty}__z{zvk}"].astype(float)
+        arr_raw = arr_raw[np.isfinite(arr_raw)]
+        x_all   = to_plot_space(arr_raw, qty)
+        x_all   = x_all[np.isfinite(x_all)]
+        xlim    = robust_xlim(x_all, qty)
+        xgrid   = np.linspace(xlim[0], xlim[1], KDE_NPTS)
+
+        pdf_unw  = make_kde_pdf(x_all, xgrid, weights=None, bw_factor=bw)
+        qty_peak = pdf_unw.max()
+
+        for col, weighted in enumerate([False, True]):
+            ax = axes[row, col]
+
+            x = cache[f"{MODEL}__{qty}__z{zvk}"].astype(float)
+            fin = np.isfinite(x)
+            x = to_plot_space(x[fin], qty)
+            x = x[np.isfinite(x)]
+
+            w = None
+            if weighted:
+                w = cache[f"{MODEL}__n_weight__z{zvk}"].astype(float)[fin]
+
+            pdf = make_kde_pdf(x, xgrid, weights=w, bw_factor=bw)
+
+            ax.fill_between(xgrid, pdf, color=col_colors[col], alpha=0.15, linewidth=0)
+            ax.plot(xgrid, pdf, color=col_colors[col], lw=LW)
+
+            if qty == "alpha":
+                ax.axvline(1.0, color="0.5", lw=0.8, ls="--", zorder=0)
+
+            ax.set_xlim(xlim)
+            ax.set_ylim(bottom=0)
+            if qty in YMAX_FRACTION:
+                ax.set_ylim(0, qty_peak * YMAX_FRACTION[qty])
+
+            ax.tick_params(axis="y", which="both",
+                           left=False, right=False, labelleft=False)
+            ax.tick_params(axis="x", which="both",
+                           bottom=True, top=False,
+                           direction="in", labelsize=FS_TICK)
+            ax.set_xlabel("")
+
+            if col == 1:
+                ax.text(1.03, 0.5, ROW_LABELS[qty],
+                        transform=ax.transAxes,
+                        ha="left", va="center",
+                        fontsize=FS_LABEL)
+
+        # annotations in top-left panel only
+        if row == 0:
+            axes[0, 0].text(0.8, 0.94, rf"$z = {zvk}\ \mathrm{{pc}}$",
+                            transform=axes[0, 0].transAxes,
+                            ha="left", va="top",
+                            fontsize=FS_LABEL - 0.5, color="0.35")
+
+
+    out_path = os.path.join(OUT_DIR, OUT_FILE)
+    fig.savefig(out_path, dpi=DPI, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {out_path}")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# ██  MAIN
+# ════════════════════════════════════════════════════════════════════════════
+def main():
+    os.makedirs(OUT_DIR, exist_ok=True)
+
+    mpl.rcParams.update({
+        "font.family"        : "serif",
+        "font.size"          : FS_TICK,
+        "axes.labelsize"     : FS_LABEL,
+        "axes.linewidth"     : 0.6,
+        "xtick.major.width"  : 0.5,
+        "ytick.major.width"  : 0.5,
+        "xtick.minor.visible": True,
+        "ytick.minor.visible": False,
+        "xtick.direction"    : "in",
+        "ytick.direction"    : "in",
+    })
+
+    make_figure()
+
+
+if __name__ == "__main__":
+    main()
