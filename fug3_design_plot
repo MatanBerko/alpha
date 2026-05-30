@@ -1,0 +1,353 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Plot script for 2D slice maps.
+Loads cache from compute_slices.py and produces one PNG per model variant.
+HIM definition: Pth < 0.5 * Pmin (strict).
+Crops to a 500x500 pc square centered on origin. No circular mask.
+
+Variants produced:
+  RAW            — raw data, HIM cells visible
+  RAW_HIMWHITE   — raw data, HIM cells masked to NaN
+  HIM_A          — HIM cells replaced at Pmin
+  HIM_B          — HIM cells replaced at Pmax
+"""
+
+import os
+import numpy as np
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap, BoundaryNorm
+
+# ════════════════════════════════════════════════════════════════════════════
+# ██  PATHS
+# ════════════════════════════════════════════════════════════════════════════
+CACHE_PATH = r"C:\Users\matan\Desktop\research_10.0\fig3_slices\compute_data.npz"
+OUT_DIR    = r"C:\Users\matan\Desktop\research_10.0\fig3_slices\outputs_slices"
+
+# ════════════════════════════════════════════════════════════════════════════
+# ██  SCIENCE SETTINGS
+# ════════════════════════════════════════════════════════════════════════════
+Z_LIST_PC = [0, 150, 300]
+XY_MAX_PC = 500.0
+P_FLOOR   = 1e-30
+N_FLOOR   = 1e-6
+IUV_FLOOR = 1e-30
+
+PHASES = [
+    ("CNM", 0.0,    300.0),
+    ("UNM", 300.0,  6000.0),
+    ("WNM", 6000.0, np.inf),
+]
+
+# ════════════════════════════════════════════════════════════════════════════
+# ██  PLOT DESIGN SETTINGS
+# ════════════════════════════════════════════════════════════════════════════
+CFG = {
+    "cmap_n"    : "YlOrBr",
+    "cmap_Iuv"  : "afmhot",
+    "cmap_Pth"  : "RdPu",
+    "cmap_Ptot" : "RdPu",
+    "cmap_alpha": "RdYlBu_r",
+
+    "phase_colors": [
+        tuple(np.array([37,  85, 115]) / 255),
+        tuple(np.array([228, 210, 132]) / 255),
+        tuple(np.array([194, 83,  81])  / 255),
+    ],
+
+    "nan_color": "#d0d0d0",
+
+    "pct_n"    : (1, 99),
+    "pct_Iuv"  : (1, 99),
+    "pct_alpha": (2, 98),
+
+    "P_range_fixed": (2.0, 4.5),
+    "alpha_vmin"   : 1.0,
+
+    "figsize" : (18, 9),
+    "dpi"     : 300,
+    "hspace"  : 0.04,
+    "wspace"  : 0.02,
+
+    "cbar_pad"       : 0.035,
+    "cbar_height"    : 0.02,
+    "cbar_tick_fs"   : 8,
+    "cbar_label_fs"  : 10,
+    "cbar_nticks"    : 4,
+    "cbar_header_gap": 0.45,
+
+    "phase_fs" : 8,
+    "zlabel_fs": 10,
+
+    "scalebar_length_pc": 200,
+    "scalebar_color"    : "black",
+    "scalebar_lw"       : 2.5,
+    "scalebar_fs"       : 9,
+}
+
+# ════════════════════════════════════════════════════════════════════════════
+# ██  HELPERS
+# ════════════════════════════════════════════════════════════════════════════
+def log10_clip(arr, floor):
+    return np.log10(np.clip(arr.astype(float), floor, None))
+
+def phase_map(T2d):
+    pid = np.zeros(T2d.shape, dtype=np.float32)
+    pid[(T2d >= 300.0) & (T2d < 6000.0)] = 1
+    pid[T2d >= 6000.0] = 2
+    return pid
+
+def robust_vminmax(arrays, pct):
+    stack = np.concatenate([a[np.isfinite(a)].ravel() for a in arrays])
+    if stack.size == 0:
+        return 0.0, 1.0
+    lo, hi = np.percentile(stack, pct)
+    return float(lo), float(hi)
+
+def apply_him_mask(img, him_mask):
+    """Set HIM cells to NaN."""
+    out = img.copy().astype(float)
+    if him_mask is not None:
+        out[him_mask] = np.nan
+    return out
+
+def prep_cmap(name):
+    cmap = mpl.cm.get_cmap(name)
+    cmap.set_bad(CFG["nan_color"])
+    return cmap
+
+# ════════════════════════════════════════════════════════════════════════════
+# ██  COLORBAR
+# ════════════════════════════════════════════════════════════════════════════
+def add_colorbar(fig, ax, cmap, vmin, vmax, label, is_phase=False):
+    fig.canvas.draw()
+    bbox = ax.get_position()
+    cax  = fig.add_axes([bbox.x0,
+                         bbox.y1 + CFG["cbar_pad"],
+                         bbox.width,
+                         CFG["cbar_height"]])
+
+    if is_phase:
+        pcmap  = ListedColormap(CFG["phase_colors"])
+        pcmap.set_bad(CFG["nan_color"])
+        bounds = np.arange(len(PHASES) + 1)
+        pnorm  = BoundaryNorm(bounds, pcmap.N)
+        cax.imshow(np.arange(len(PHASES))[None, :],
+                   aspect="auto", cmap=pcmap, norm=pnorm,
+                   interpolation="nearest")
+        cax.set_xticks([]); cax.set_yticks([])
+        for sp in cax.spines.values():
+            sp.set_visible(True); sp.set_linewidth(0.7)
+        for i, (name_p, _, _) in enumerate(PHASES):
+            cax.text((i + 0.5) / len(PHASES), 0.5, name_p,
+                     transform=cax.transAxes,
+                     ha="center", va="center",
+                     fontsize=CFG["phase_fs"], color="black")
+        for i in range(1, len(PHASES)):
+            cax.text(i / len(PHASES), -0.5,
+                     f"{int(PHASES[i][1])} K",
+                     transform=cax.transAxes,
+                     ha="center", va="top",
+                     fontsize=CFG["phase_fs"] - 1, color="black")
+    else:
+        norm = mpl.colors.Normalize(vmin=vmin, vmax=vmax)
+        sm   = mpl.cm.ScalarMappable(norm=norm, cmap=cmap)
+        cb   = fig.colorbar(sm, cax=cax, orientation="horizontal")
+        cb.locator = mpl.ticker.MaxNLocator(nbins=CFG["cbar_nticks"], prune="both")
+        cb.update_ticks()
+        cax.xaxis.set_ticks_position("bottom")
+        cax.tick_params(which="both", top=False, bottom=True,
+                        labeltop=False, labelbottom=True,
+                        labelsize=CFG["cbar_tick_fs"], length=3, pad=2)
+
+    cax.text(0.5, 1.0 + CFG["cbar_header_gap"], label,
+             transform=cax.transAxes,
+             ha="center", va="bottom",
+             fontsize=CFG["cbar_label_fs"])
+    return cax
+
+# ════════════════════════════════════════════════════════════════════════════
+# ██  SINGLE FIGURE
+# ════════════════════════════════════════════════════════════════════════════
+def make_figure(model_name, slices_dict, him_mask_sl, ranges, extent, out_path):
+    col_keys     = ["n",     "Iuv",   "T",     "Pth",   "Ptot",  "alpha"]
+    col_cmaps    = [prep_cmap(CFG["cmap_n"]),
+                    prep_cmap(CFG["cmap_Iuv"]),
+                    None,
+                    prep_cmap(CFG["cmap_Pth"]),
+                    prep_cmap(CFG["cmap_Ptot"]),
+                    prep_cmap(CFG["cmap_alpha"])]
+    col_labels   = [r"$\log_{10}\,n\ [\mathrm{cm}^{-3}]$",
+                    r"$\log_{10}\,I_\mathrm{UV}$",
+                    r"$T$ phases",
+                    r"$\log_{10}(P_\mathrm{th}/k_B)\ [\mathrm{K\,cm}^{-3}]$",
+                    r"$\log_{10}(P_\mathrm{tot}/k_B)\ [\mathrm{K\,cm}^{-3}]$",
+                    r"$\alpha = P_\mathrm{tot}/P_\mathrm{th}$"]
+    col_is_phase = [False, False, True, False, False, False]
+
+    phase_cmap = ListedColormap(CFG["phase_colors"])
+    phase_cmap.set_bad(CFG["nan_color"])
+
+    nrows, ncols = 3, 6
+    fig, axes = plt.subplots(
+        nrows, ncols,
+        figsize=CFG["figsize"], dpi=CFG["dpi"],
+        gridspec_kw={"hspace": CFG["hspace"], "wspace": CFG["wspace"]},
+    )
+
+    for ci, (key, cmap, label, is_phase) in enumerate(
+            zip(col_keys, col_cmaps, col_labels, col_is_phase)):
+
+        vmin, vmax = ranges[key]
+
+        for ri in range(nrows):
+            ax  = axes[ri, ci]
+            him = him_mask_sl[ri] if him_mask_sl is not None else None
+            img = apply_him_mask(slices_dict[key][ri], him)
+
+            if is_phase:
+                ax.imshow(img, origin="lower", extent=extent,
+                          cmap=phase_cmap, vmin=-0.5, vmax=len(PHASES) - 0.5,
+                          aspect="equal", interpolation="none")
+            else:
+                ax.imshow(img, origin="lower", extent=extent,
+                          cmap=cmap,
+                          norm=mpl.colors.Normalize(vmin=vmin, vmax=vmax),
+                          aspect="equal", interpolation="none")
+
+            ax.set_xticks([]); ax.set_yticks([])
+            for sp in ax.spines.values():
+                sp.set_visible(True)
+                sp.set_linewidth(0.5)
+                sp.set_edgecolor("black")
+
+            if ci == 0:
+                ax.text(0.03, 0.97,
+                        f"z = {Z_LIST_PC[ri]} pc",
+                        transform=ax.transAxes,
+                        ha="left", va="top",
+                        color="white", fontsize=CFG["zlabel_fs"],
+                        bbox=dict(boxstyle="round,pad=0.25",
+                                  fc="black", ec="none", alpha=0.45))
+
+        add_colorbar(fig, axes[0, ci], cmap, vmin, vmax,
+                     label, is_phase=is_phase)
+
+    # Scale bar in bottom-left panel
+    ax_sb = axes[-1, 0]
+    xl, xr = extent[0], extent[1]
+    yb, yt = extent[2], extent[3]
+    sb = CFG["scalebar_length_pc"]
+    mx = 0.05 * (xr - xl)
+    my = 0.05 * (yt - yb)
+    x1 = xr - mx
+    x0 = x1 - sb
+    y0 = yb + my
+    ax_sb.plot([x0, x1], [y0, y0],
+               color=CFG["scalebar_color"], lw=CFG["scalebar_lw"],
+               solid_capstyle="butt", transform=ax_sb.transData)
+    ax_sb.text((x0 + x1) / 2, y0 + 0.04 * (yt - yb), f"{sb} pc",
+               color=CFG["scalebar_color"], fontsize=CFG["scalebar_fs"],
+               ha="center", va="bottom", transform=ax_sb.transData,
+               bbox=dict(boxstyle="round,pad=0.15", fc="black", ec="none", alpha=0.4))
+
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {out_path}")
+
+# ════════════════════════════════════════════════════════════════════════════
+# ██  BUILD RANGES
+# ════════════════════════════════════════════════════════════════════════════
+def build_ranges(d, x_crop, y_crop):
+
+    def cropped_arrays(key_prefix, floor):
+        return [log10_clip(d[f"{key_prefix}_z{int(zv)}"][x_crop, y_crop], floor)
+                for zv in Z_LIST_PC]
+
+    rng = {}
+    rng["n"]    = robust_vminmax(cropped_arrays("n_raw",  N_FLOOR),   CFG["pct_n"])
+    rng["Iuv"]  = robust_vminmax(cropped_arrays("Iuv",    IUV_FLOOR), CFG["pct_Iuv"])
+    rng["T"]    = (-0.5, len(PHASES) - 0.5)
+    rng["Pth"]  = CFG["P_range_fixed"]
+    rng["Ptot"] = CFG["P_range_fixed"]
+
+    alpha_arrays = []
+    for zv in Z_LIST_PC:
+        Ptot  = d[f"PtotB_z{int(zv)}"][x_crop, y_crop].astype(float)
+        Pth   = d[f"PthB_z{int(zv)}"][x_crop, y_crop].astype(float)
+        him   = d[f"him_mask_z{int(zv)}"][x_crop, y_crop].astype(bool)
+        alpha = Ptot / np.clip(Pth, P_FLOOR, None)
+        alpha[him] = np.nan
+        alpha_arrays.append(alpha)
+    rng["alpha"] = (CFG["alpha_vmin"],
+                    robust_vminmax(alpha_arrays, CFG["pct_alpha"])[1])
+
+    return rng
+
+# ════════════════════════════════════════════════════════════════════════════
+# ██  MAIN PLOT
+# ════════════════════════════════════════════════════════════════════════════
+def plot_all():
+    os.makedirs(OUT_DIR, exist_ok=True)
+
+    print(f"Loading cache from {CACHE_PATH}...")
+    raw = np.load(CACHE_PATH)
+    d   = {k: raw[k] for k in raw.files}
+    print("Cache loaded.")
+
+    x_pc = d["x_pc"]
+    y_pc = d["y_pc"]
+
+    # ── Square crop ───────────────────────────────────────────────────────
+    x_mask = (x_pc >= -XY_MAX_PC) & (x_pc <= XY_MAX_PC)
+    y_mask = (y_pc >= -XY_MAX_PC) & (y_pc <= XY_MAX_PC)
+    xi     = np.where(x_mask)[0]
+    yi     = np.where(y_mask)[0]
+    x_crop = slice(xi[0], xi[-1] + 1)
+    y_crop = slice(yi[0], yi[-1] + 1)
+    extent = [float(x_pc[xi[0]]),  float(x_pc[xi[-1]]),
+              float(y_pc[yi[0]]),  float(y_pc[yi[-1]])]
+    print(f"  Crop: x [{extent[0]:.0f}, {extent[1]:.0f}] pc, "
+          f"y [{extent[2]:.0f}, {extent[3]:.0f}] pc")
+
+    rng = build_ranges(d, x_crop, y_crop)
+
+    # ── Slice assembly helpers ────────────────────────────────────────────
+    def crop(arr2d):
+        return np.asarray(arr2d, dtype=float)[x_crop, y_crop]
+
+    def get_slices(Ptot_key, Pth_key, n_key="n_raw"):
+        sl = {
+            "n"   : [log10_clip(crop(d[f"{n_key}_z{int(zv)}"]),  N_FLOOR)   for zv in Z_LIST_PC],
+            "Iuv" : [log10_clip(crop(d[f"Iuv_z{int(zv)}"]),      IUV_FLOOR) for zv in Z_LIST_PC],
+            "T"   : [phase_map(crop(d[f"T_z{int(zv)}"])) for zv in Z_LIST_PC],
+            "Pth" : [log10_clip(crop(d[f"Pth_raw_z{int(zv)}"]),  P_FLOOR)   for zv in Z_LIST_PC],
+            "Ptot": [log10_clip(crop(d[f"{Ptot_key}_z{int(zv)}"]), P_FLOOR) for zv in Z_LIST_PC],
+            "alpha": [
+                crop(d[f"{Ptot_key}_z{int(zv)}"]) /
+                np.clip(crop(d[f"{Pth_key}_z{int(zv)}"]), P_FLOOR, None)
+                for zv in Z_LIST_PC
+            ],
+        }
+        return sl
+
+    him = [crop(d[f"him_mask_z{int(zv)}"]).astype(bool) for zv in Z_LIST_PC]
+
+    # ── 4 variants ────────────────────────────────────────────────────────
+    variants = [
+        ("RAW",          get_slices("Ptot_raw", "Pth_raw"),        None),
+        ("RAW_HIMWHITE", get_slices("Ptot_raw", "Pth_raw"),        him),
+        ("HIM_A",        get_slices("PtotA",    "PthA",   "nA"),   him),
+        ("HIM_B",        get_slices("PtotB",    "PthB",   "nB"),   him),
+    ]
+
+    for fname, sl, him_sl in variants:
+        out_path = os.path.join(OUT_DIR, f"{fname}.png")
+        make_figure(fname, sl, him_sl, rng, extent, out_path)
+
+    print(f"\nAll figures saved to: {OUT_DIR}")
+
+
+if __name__ == "__main__":
+    plot_all()
