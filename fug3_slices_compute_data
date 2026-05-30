@@ -1,0 +1,304 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Compute script for 2D slice maps.
+Saves all model variants to a single .npz cache.
+HIM definition: Pth < 0.5 * Pmin (strict).
+
+Models saved:
+  RAW   — raw data, no HIM treatment
+  HIM_A — HIM cells replaced at Pmin
+  HIM_B — HIM cells replaced at Pmax
+
+The 500 pc XY cylinder is applied ONLY to the 2D slice data saved for plotting.
+Ptot integration uses the full XY plane (gravity is a column integral, not local).
+"""
+
+import os
+import warnings
+import numpy as np
+import zarr
+import dask.array as da
+from scipy.io import loadmat
+from scipy.interpolate import interp1d
+
+# ════════════════════════════════════════════════════════════════════════════
+# ██  PATHS
+# ════════════════════════════════════════════════════════════════════════════
+ZARR_PATH  = r"C:\Users\matan\Desktop\research_10.0\datasets\f98_sm_opt2_edendist.zarr"
+MAT_PATH   = r"C:\Users\matan\Desktop\research_10.0\datasets\Temp_Bialy_interp.mat"
+CACHE_PATH = r"C:\Users\matan\Desktop\research_10.0\fig3_slices\compute_data.npz"
+
+# ════════════════════════════════════════════════════════════════════════════
+# ██  SETTINGS
+# ════════════════════════════════════════════════════════════════════════════
+Z_LIST_PC  = [0, 150, 300]
+R_MAX_PC   = 500.0        # XY cylinder radius for saved slice data
+
+RHO_FIELD  = "density"
+IUV_FIELD  = "Iuv_final"
+T_FIELD    = "T"
+T_HIM      = 1.0e6        # K — temperature assigned to HIM cells in A/B models
+
+# ════════════════════════════════════════════════════════════════════════════
+# ██  PHYSICAL CONSTANTS
+# ════════════════════════════════════════════════════════════════════════════
+K_B    = 1.380649e-16
+M_H    = 1.6735575e-24
+MU     = 1.4
+PC_CM  = 3.085677581491367e18
+
+SIGMA_STAR          = 38.4
+Z_H_PC              = 413.0
+RHO_DM              = 0.0133
+G_PC_MSUN_KMS       = 4.30091e-3
+KM2S2_PER_PC_TO_CGS = 1.0e10 / PC_CM
+
+IUV_FLOOR = 1e-30
+P_FLOOR   = 1e-30
+
+# ════════════════════════════════════════════════════════════════════════════
+# ██  HELPERS
+# ════════════════════════════════════════════════════════════════════════════
+def nearest_idx(arr, val):
+    return int(np.argmin(np.abs(arr - val)))
+
+def f64(x):
+    return np.asarray(x, dtype=np.float64)
+
+def g_ext_cgs(z_pc):
+    """Gravitational acceleration |g(z)| in CGS (cm s⁻²)."""
+    z     = np.abs(z_pc)
+    sigma = SIGMA_STAR * (1.0 - np.exp(-z / Z_H_PC)) + 2.0 * RHO_DM * z
+    return 2.0 * np.pi * G_PC_MSUN_KMS * sigma * KM2S2_PER_PC_TO_CGS
+
+# ════════════════════════════════════════════════════════════════════════════
+# ██  Pmin / Pmax FROM BS19 MAT FILE
+# ════════════════════════════════════════════════════════════════════════════
+def build_pmin_pmax_functions(mat_path):
+    """
+    Returns (Pmin_fn, Pmax_fn): each takes a 2D Iuv array and returns
+    the corresponding pressure threshold in units of K cm⁻³ (= P/k_B).
+    Pmin = lower turning point of the n(P) curve (WNM/UNM boundary)
+    Pmax = upper turning point of the n(P) curve (UNM/CNM boundary)
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        d = loadmat(mat_path)
+
+    IUV_grid = np.array(d["IUV_"]).squeeze().astype(float).ravel()
+    P_grid   = np.array(d["P_"]).squeeze().astype(float).ravel()
+    T_2d_P   = np.array(d["T_2d_P"]).astype(float)
+
+    if np.any(np.diff(P_grid) <= 0):
+        order  = np.argsort(P_grid)
+        P_grid = P_grid[order]
+        T_2d_P = T_2d_P[:, order]
+
+    Pmin_arr = np.full(len(IUV_grid), np.nan)
+    Pmax_arr = np.full(len(IUV_grid), np.nan)
+
+    for i in range(len(IUV_grid)):
+        T_row = np.clip(T_2d_P[i], 1e-30, None)
+        n_row = np.clip(P_grid / T_row, 1e-30, None)
+        dndP  = np.gradient(n_row, P_grid)
+        s     = np.sign(dndP); s[s == 0] = 1
+        chg   = np.where(s[:-1] * s[1:] < 0)[0]
+        if chg.size == 0:
+            continue
+
+        def lin_root(j):
+            x0, x1 = P_grid[j], P_grid[j + 1]
+            y0, y1 = dndP[j],   dndP[j + 1]
+            return x0 - y0 * (x1 - x0) / (y1 - y0) if (y1 - y0) != 0 else x0
+
+        Pmin_arr[i] = lin_root(int(chg[0]))
+        Pmax_arr[i] = lin_root(int(chg[-1]))
+
+    def make_interp(P_arr):
+        good = np.isfinite(P_arr) & (P_arr > 0) & (IUV_grid > 0)
+        logI = np.log10(IUV_grid[good])
+        logP = np.log10(P_arr[good])
+        idx  = np.argsort(logI)
+        f = interp1d(logI[idx], logP[idx], kind="linear",
+                     bounds_error=False,
+                     fill_value=(logP[idx][0], logP[idx][-1]))
+        return lambda Iuv2d: 10.0 ** f(
+            np.log10(np.clip(np.asarray(Iuv2d, float), IUV_FLOOR, None)))
+
+    print(f"  Pmin range: {np.nanmin(Pmin_arr):.3g} .. {np.nanmax(Pmin_arr):.3g} K cm⁻³")
+    print(f"  Pmax range: {np.nanmin(Pmax_arr):.3g} .. {np.nanmax(Pmax_arr):.3g} K cm⁻³")
+    return make_interp(Pmin_arr), make_interp(Pmax_arr)
+
+# ════════════════════════════════════════════════════════════════════════════
+# ██  PTOT HYDROSTATIC INTEGRATION
+# ════════════════════════════════════════════════════════════════════════════
+def compute_Ptot_slices(n_all_by_model, z_pc_full, z_req):
+    """
+    Integrates P_tot(z) = ∫_z^∞ ρ(z') g(z') dz' downward from the top.
+    Uses the full XY plane — gravity is a column property.
+    Returns: {model_name: {float(z_pc): 2D Ptot/kB array}}
+    """
+    pos   = np.where(z_pc_full >= 0)[0]
+    zpos  = z_pc_full[pos]
+    order = np.argsort(zpos)
+    pos   = pos[order]
+    zpos  = zpos[order]
+
+    g     = g_ext_cgs(zpos)
+    z_cm  = zpos * PC_CM
+    dz    = np.diff(z_cm)
+    j_top = len(zpos) - 1
+
+    req_j = {float(zv): nearest_idx(zpos, float(zv)) for zv in z_req}
+    out   = {m: {} for m in n_all_by_model}
+
+    for model, n_planes in n_all_by_model.items():
+        P_above     = np.zeros_like(f64(n_planes[pos[j_top]]))
+        rho_above   = MU * M_H * f64(n_planes[pos[j_top]])
+        integ_above = rho_above * g[j_top]
+
+        for zv, j in req_j.items():
+            if j == j_top:
+                out[model][zv] = (P_above / K_B).copy()
+
+        for j in range(j_top - 1, -1, -1):
+            iz      = pos[j]
+            rho_j   = MU * M_H * f64(n_planes[iz])
+            integ_j = rho_j * g[j]
+            P_j     = P_above + 0.5 * (integ_j + integ_above) * dz[j]
+
+            for zv, jj in req_j.items():
+                if jj == j and zv not in out[model]:
+                    out[model][zv] = (P_j / K_B).copy()
+
+            P_above     = P_j
+            integ_above = integ_j
+
+    return out
+
+# ════════════════════════════════════════════════════════════════════════════
+# ██  MAIN COMPUTE
+# ════════════════════════════════════════════════════════════════════════════
+def compute_and_cache():
+    print("=== COMPUTE MODE (HIM: Pth < 0.5·Pmin) ===")
+
+    root      = zarr.open(ZARR_PATH, mode="r")
+    x_pc      = f64(root["x_pc"][:]).ravel()
+    y_pc      = f64(root["y_pc"][:]).ravel()
+    z_pc_full = f64(root["z_pc"][:]).ravel()
+    n_zarr    = root[RHO_FIELD]
+    Iuv_zarr  = root[IUV_FIELD]
+
+    print("Loading full T array...")
+    T_full = da.from_zarr(os.path.join(ZARR_PATH, T_FIELD)).compute().astype(np.float64)
+    print(f"  T shape: {T_full.shape}")
+
+    # ── XY radius mask (applied to slice data only) ───────────────────────
+    XX, YY      = np.meshgrid(x_pc, y_pc, indexing="ij")
+    R2D         = np.sqrt(XX**2 + YY**2)
+    r_mask      = R2D <= R_MAX_PC
+    print(f"  R <= {R_MAX_PC} pc: {r_mask.sum()} / {r_mask.size} cells "
+          f"({100 * r_mask.mean():.1f}%)")
+
+    # ── Pmin / Pmax interpolators ─────────────────────────────────────────
+    print("Building Pmin/Pmax functions...")
+    Pmin_func, Pmax_func = build_pmin_pmax_functions(MAT_PATH)
+
+    # ── Z indices ─────────────────────────────────────────────────────────
+    z_idx = [nearest_idx(z_pc_full, z) for z in Z_LIST_PC]
+    print(f"  z = {Z_LIST_PC} pc → indices {z_idx}")
+
+    # ── Load 2D slices ────────────────────────────────────────────────────
+    print("Loading 2D slices...")
+    n_raw_sl = [f64(n_zarr[k, :, :])    for k in z_idx]
+    T_sl     = [f64(T_full[k, :, :])    for k in z_idx]
+    Iuv_sl   = [f64(Iuv_zarr[k, :, :]) for k in z_idx]
+
+    # ── Pth and HIM mask (strict: Pth < 0.5·Pmin) ────────────────────────
+    Pth_raw_sl = [n2d * T2d for n2d, T2d in zip(n_raw_sl, T_sl)]
+    Pmin_sl    = [Pmin_func(I2d) for I2d in Iuv_sl]
+    Pmax_sl    = [Pmax_func(I2d) for I2d in Iuv_sl]
+
+    him_mask_sl = [(Pth < 0.5 * Pmin) & np.isfinite(Pmin)
+                   for Pth, Pmin in zip(Pth_raw_sl, Pmin_sl)]
+
+    # ── Build HIM_A and HIM_B slice variants ──────────────────────────────
+    nA_sl, PthA_sl = [], []
+    for n2d, Pth, him, Pmin in zip(n_raw_sl, Pth_raw_sl, him_mask_sl, Pmin_sl):
+        nA   = n2d.copy();  nA[him]   = Pmin[him] / T_HIM
+        PthA = Pth.copy();  PthA[him] = Pmin[him]
+        nA_sl.append(nA);   PthA_sl.append(PthA)
+
+    nB_sl, PthB_sl = [], []
+    for n2d, Pth, him, Pmax in zip(n_raw_sl, Pth_raw_sl, him_mask_sl, Pmax_sl):
+        nB   = n2d.copy();  nB[him]   = Pmax[him] / T_HIM
+        PthB = Pth.copy();  PthB[him] = Pmax[him]
+        nB_sl.append(nB);   PthB_sl.append(PthB)
+
+    # ── Full-z n arrays for Ptot integration (HIM: Pth < 0.5·Pmin) ───────
+    print("Building full-z n arrays for Ptot integration...")
+
+    def full_z_n(model_name):
+        n_planes = []
+        for iz in range(len(z_pc_full)):
+            nz  = f64(n_zarr[iz, :, :])
+            Iz  = f64(Iuv_zarr[iz, :, :])
+            Tz  = f64(T_full[iz, :, :])
+            Pth = nz * Tz
+            Pm  = Pmin_func(Iz)
+            PM  = Pmax_func(Iz)
+            him = (Pth < 0.5 * Pm) & np.isfinite(Pm)
+            if model_name == "RAW":
+                n_planes.append(nz)
+            elif model_name == "HIM_A":
+                nA = nz.copy(); nA[him] = Pm[him] / T_HIM
+                n_planes.append(nA)
+            elif model_name == "HIM_B":
+                nB = nz.copy(); nB[him] = PM[him] / T_HIM
+                n_planes.append(nB)
+            if iz % 50 == 0:
+                print(f"  {model_name}: plane {iz}/{len(z_pc_full) - 1}")
+        return n_planes
+
+    n_all_models = {}
+    for model in ["RAW", "HIM_A", "HIM_B"]:
+        print(f"  Building {model}...")
+        n_all_models[model] = full_z_n(model)
+
+    # ── Ptot integration ──────────────────────────────────────────────────
+    print("Integrating Ptot...")
+    Ptot_maps = compute_Ptot_slices(n_all_models, z_pc_full, Z_LIST_PC)
+
+    # ── Pack and save cache ───────────────────────────────────────────────
+    # Slice data is saved as-is (full XY); the plot script applies r_mask.
+    print("Packing cache...")
+    save_dict = {
+        "x_pc"     : x_pc,
+        "y_pc"     : y_pc,
+        "r_mask"   : r_mask.astype(bool),
+        "Z_LIST_PC": np.array(Z_LIST_PC, dtype=float),
+    }
+
+    for zi, zv in enumerate(Z_LIST_PC):
+        tag = f"z{int(zv)}"
+        save_dict[f"n_raw_{tag}"]    = n_raw_sl[zi].astype(np.float32)
+        save_dict[f"T_{tag}"]        = T_sl[zi].astype(np.float32)
+        save_dict[f"Iuv_{tag}"]      = Iuv_sl[zi].astype(np.float32)
+        save_dict[f"him_mask_{tag}"] = him_mask_sl[zi]
+        save_dict[f"Pth_raw_{tag}"]  = Pth_raw_sl[zi].astype(np.float32)
+        save_dict[f"PthA_{tag}"]     = PthA_sl[zi].astype(np.float32)
+        save_dict[f"PthB_{tag}"]     = PthB_sl[zi].astype(np.float32)
+        save_dict[f"nA_{tag}"]       = nA_sl[zi].astype(np.float32)
+        save_dict[f"nB_{tag}"]       = nB_sl[zi].astype(np.float32)
+        save_dict[f"Ptot_raw_{tag}"] = Ptot_maps["RAW"][float(zv)].astype(np.float32)
+        save_dict[f"PtotA_{tag}"]    = Ptot_maps["HIM_A"][float(zv)].astype(np.float32)
+        save_dict[f"PtotB_{tag}"]    = Ptot_maps["HIM_B"][float(zv)].astype(np.float32)
+
+    os.makedirs(os.path.dirname(CACHE_PATH), exist_ok=True)
+    np.savez_compressed(CACHE_PATH, **save_dict)
+    print(f"Saved → {CACHE_PATH}")
+
+
+if __name__ == "__main__":
+    compute_and_cache()
